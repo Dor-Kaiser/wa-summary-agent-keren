@@ -215,27 +215,6 @@ async function syncTodayMessagesFromWhatsApp() {
     const nowSec = Math.floor(Date.now() / 1000);
     const sinceSec = nowSec - 172800;
 
-    async function waitForStoreReady() {
-      for (let i = 1; i <= 20; i++) {
-        try {
-          const ready = await client.pupPage.evaluate(() => {
-            return !!(window.Store && window.Store.Chat && window.Store.Msg);
-          });
-
-          if (ready) {
-            log("WAIT", "WhatsApp Store ready");
-            return;
-          }
-        } catch (e) {}
-
-        log("WAIT", `Store not ready (${i}/20)`);
-        await new Promise(r => setTimeout(r, 3000));
-      }
-
-      throw new Error("WhatsApp Store never became ready");
-    }
-
-    await waitForStoreReady();
 
     const normalize = s => (s || "").toLowerCase().replace(/[^a-z0-9 ]/g, "");
 
