@@ -1,0 +1,17 @@
+services:
+  wa-summary-agent:
+    build: .
+    container_name: wa-summary-agent
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+      PORT: 8080
+    volumes:
+      - wa-summary-data:/data
+
+volumes:
+  wa-summary-data:
