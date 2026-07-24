@@ -7,7 +7,7 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "whatsapp-web.js": "1.26.0",
+    "whatsapp-web.js": "github:pedroslopez/whatsapp-web.js#main",
     "qrcode": "^1.5.3",
     "axios": "^1.6.0",
     "better-sqlite3": "^9.4.0",
