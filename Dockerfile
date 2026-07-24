@@ -1,6 +1,6 @@
 FROM node:20-slim
 
-RUN apt-get update && apt-get install -y     git     chromium     chromium-sandbox     fonts-freefont-ttf     fonts-noto     libxss1     libnss3     libatk-bridge2.0-0     libgtk-3-0     libgbm1     libasound2     --no-install-recommends     && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y     git     openssh-client     chromium     chromium-sandbox     fonts-freefont-ttf     fonts-noto     libxss1     libnss3     libatk-bridge2.0-0     libgtk-3-0     libgbm1     libasound2     --no-install-recommends     && rm -rf /var/lib/apt/lists/*
 
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
