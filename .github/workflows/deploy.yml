@@ -10,13 +10,33 @@ jobs:
     steps:
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TARGET_GROUP_NAME: ${{ secrets.TARGET_GROUP_NAME }}
+          MY_NUMBER: ${{ secrets.MY_NUMBER }}
+          SUMMARY_HOUR: ${{ secrets.SUMMARY_HOUR }}
+          SUMMARY_MINUTE: ${{ secrets.SUMMARY_MINUTE }}
+          SUMMARY_TIMEZONE: ${{ secrets.SUMMARY_TIMEZONE }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.SSH_PORT }}
+          envs: GEMINI_API_KEY,TARGET_GROUP_NAME,MY_NUMBER,SUMMARY_HOUR,SUMMARY_MINUTE,SUMMARY_TIMEZONE
           script: |
+            set -e
             cd ~/wa-summary-bot
             git pull origin main
+            umask 077
+            printf '%s\n' \
+              "GEMINI_API_KEY=${GEMINI_API_KEY}" \
+              "TARGET_GROUP_NAME=${TARGET_GROUP_NAME}" \
+              "MY_NUMBER=${MY_NUMBER}" \
+              "SUMMARY_HOUR=${SUMMARY_HOUR}" \
+              "SUMMARY_MINUTE=${SUMMARY_MINUTE}" \
+              "SUMMARY_TIMEZONE=${SUMMARY_TIMEZONE}" \
+              "DATA_DIR=/data" \
+              "PORT=8080" \
+              > .env
             docker compose up -d --build
             docker image prune -f
