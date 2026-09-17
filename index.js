@@ -226,13 +226,35 @@ async function listChatsViaPage() {
     try {
       Chat = window.Store && window.Store.Chat;
     } catch (e) {}
-    if (!Chat) {
+    
+    if (!Chat && typeof window.require !== 'undefined') {
       try {
         Chat = window.require('WAWebCollections').Chat;
-      } catch (e) {
-        throw new Error('Chat collection unavailable');
-      }
+      } catch (e) {}
     }
+    
+    if (!Chat && window.webpackChunkwhatsapp_web_client) {
+      window.webpackChunkwhatsapp_web_client.push([
+        ["hack_chats_sync"],
+        {},
+        (e) => {
+          for (let m in e.m) {
+            try {
+              let mod = e(m);
+              if (mod && mod.Chat && mod.Chat.getModelsArray) {
+                Chat = mod.Chat;
+                break;
+              }
+            } catch (err) {}
+          }
+        }
+      ]);
+    }
+    
+    if (!Chat) {
+      return [];
+    }
+
     const models = Chat.getModelsArray ? Chat.getModelsArray() : (Chat.models || []);
     return models.map((c) => {
       const id = sid(c.id);
@@ -247,17 +269,50 @@ async function listChatsViaPage() {
 
 async function getChatsSafe() {
   try {
+    const chats = await withTimeout(listChatsViaPage(), 30000, 'getChatsFallback');
+    if (chats && chats.length > 0) {
+      return chats;
+    }
+    log('WARN', 'listChatsViaPage returned empty, trying client.getChats()');
+  } catch (e) {
+    log('WARN', `listChatsViaPage failed (${e.message || e}), trying client.getChats()`);
+  }
+  
+  try {
     return await withTimeout(client.getChats(), 30000, 'getChats');
   } catch (e) {
-    log('WARN', `getChats failed (${e.message || e}), using page.evaluate fallback`);
-    return withTimeout(listChatsViaPage(), 30000, 'getChatsFallback');
+    log('ERR', `Both getChats methods failed: ${e.message || e}`);
+    return [];
   }
 }
 
 async function fetchChatMessagesViaPage(chatId, limit) {
   return evaluateOnPage(async (chatId, limit) => {
     const sid = (id) => (id && (id._serialized || id.$1)) || '';
-    let Chat = (window.Store && window.Store.Chat) || window.require('WAWebCollections').Chat;
+    
+    let Chat = null;
+    try { Chat = window.Store && window.Store.Chat; } catch (e) {}
+    if (!Chat && typeof window.require !== 'undefined') {
+      try { Chat = window.require('WAWebCollections').Chat; } catch (e) {}
+    }
+    if (!Chat && window.webpackChunkwhatsapp_web_client) {
+      window.webpackChunkwhatsapp_web_client.push([
+        ["hack_chat_msgs"], {}, (e) => {
+          for (let m in e.m) {
+            try {
+              let mod = e(m);
+              if (mod && mod.Chat && mod.Chat.getModelsArray) {
+                Chat = mod.Chat;
+                break;
+              }
+            } catch (err) {}
+          }
+        }
+      ]);
+    }
+
+    if (!Chat) throw new Error('Chat collection unavailable');
+
     let chat = Chat.get ? Chat.get(chatId) : null;
     if (!chat) {
       try {
@@ -281,8 +336,23 @@ async function fetchChatMessagesViaPage(chatId, limit) {
 
     let loadEarlier = null;
     try { loadEarlier = window.Store && window.Store.ConversationMsgs && window.Store.ConversationMsgs.loadEarlierMsgs; } catch (e) {}
-    if (!loadEarlier) {
+    if (!loadEarlier && typeof window.require !== 'undefined') {
       try { loadEarlier = window.require('WAWebChatLoadMessages').loadEarlierMsgs; } catch (e) {}
+    }
+    if (!loadEarlier && window.webpackChunkwhatsapp_web_client) {
+      window.webpackChunkwhatsapp_web_client.push([
+        ["hack_load_msgs"], {}, (e) => {
+          for (let m in e.m) {
+            try {
+              let mod = e(m);
+              if (mod && mod.loadEarlierMsgs) {
+                loadEarlier = mod.loadEarlierMsgs;
+                break;
+              }
+            } catch (err) {}
+          }
+        }
+      ]);
     }
 
     let msgs = getMsgs();
