@@ -169,7 +169,9 @@ async function dailySummaryJob() {
       try {
         const numberId = await client.getNumberId(num);
         if (!numberId) { log('⚠️', `Number not on WhatsApp, skipping: ${num}`); continue; }
-        await withTimeout(client.sendMessage(numberId._serialized, text), 30000, "sendMessage");
+        const jid = serializedId(numberId);
+        if (!jid) { log('⚠️', `Could not resolve WhatsApp id for: ${num}`); continue; }
+        await withTimeout(client.sendMessage(jid, text), 30000, "sendMessage");
         log('✅', `Summary sent to ${num}`);
       } catch (e) {
         log('❌', `Failed to send to ${num}: ${e.message}`);
@@ -201,63 +203,181 @@ async function withTimeout(promise, ms, label) {
   }
 }
 
+function serializedId(id) {
+  if (!id) return '';
+  if (typeof id === 'string') return id;
+  return id._serialized || id.$1 || id.id || '';
+}
+
+function isEvaluateStoreError(err) {
+  const msg = String((err && err.message) || err || '');
+  return /(^|\b)r(: r)?\b/i.test(msg) || /Evaluation failed/i.test(msg);
+}
+
+async function evaluateOnPage(fn, ...args) {
+  if (!client.pupPage) throw new Error('WhatsApp page is not ready');
+  return client.pupPage.evaluate(fn, ...args);
+}
+
+async function listChatsViaPage() {
+  return evaluateOnPage(() => {
+    const sid = (id) => (id && (id._serialized || id.$1)) || '';
+    let Chat = null;
+    try {
+      Chat = window.Store && window.Store.Chat;
+    } catch (e) {}
+    if (!Chat) {
+      try {
+        Chat = window.require('WAWebCollections').Chat;
+      } catch (e) {
+        throw new Error('Chat collection unavailable');
+      }
+    }
+    const models = Chat.getModelsArray ? Chat.getModelsArray() : (Chat.models || []);
+    return models.map((c) => {
+      const id = sid(c.id);
+      return {
+        id,
+        name: c.name || c.formattedTitle || (c.contact && (c.contact.name || c.contact.pushname)) || '',
+        isGroup: !!(c.isGroup || (c.id && c.id.server === 'g.us') || String(id).endsWith('@g.us'))
+      };
+    }).filter((c) => c.id);
+  });
+}
+
+async function getChatsSafe() {
+  try {
+    return await withTimeout(client.getChats(), 30000, 'getChats');
+  } catch (e) {
+    log('WARN', `getChats failed (${e.message || e}), using page.evaluate fallback`);
+    return withTimeout(listChatsViaPage(), 30000, 'getChatsFallback');
+  }
+}
+
+async function fetchChatMessagesViaPage(chatId, limit) {
+  return evaluateOnPage(async (chatId, limit) => {
+    const sid = (id) => (id && (id._serialized || id.$1)) || '';
+    let Chat = (window.Store && window.Store.Chat) || window.require('WAWebCollections').Chat;
+    let chat = Chat.get ? Chat.get(chatId) : null;
+    if (!chat) {
+      try {
+        const WidFactory = window.require('WAWebWidFactory');
+        chat = Chat.get(WidFactory.createWid(chatId));
+      } catch (e) {}
+    }
+    if (!chat) {
+      const models = Chat.getModelsArray ? Chat.getModelsArray() : (Chat.models || []);
+      chat = models.find((c) => sid(c.id) === chatId);
+    }
+    if (!chat) throw new Error('Chat not found: ' + chatId);
+
+    const msgFilter = (m) => m && !m.isNotification;
+    const getMsgs = () => {
+      const col = chat.msgs;
+      if (!col) return [];
+      const arr = col.getModelsArray ? col.getModelsArray() : (col.models || []);
+      return arr.filter(msgFilter);
+    };
+
+    let loadEarlier = null;
+    try { loadEarlier = window.Store && window.Store.ConversationMsgs && window.Store.ConversationMsgs.loadEarlierMsgs; } catch (e) {}
+    if (!loadEarlier) {
+      try { loadEarlier = window.require('WAWebChatLoadMessages').loadEarlierMsgs; } catch (e) {}
+    }
+
+    let msgs = getMsgs();
+    let guard = 0;
+    while (msgs.length < limit && loadEarlier && guard < 30) {
+      guard += 1;
+      const loaded = await loadEarlier(chat);
+      if (!loaded || !loaded.length) break;
+      msgs = getMsgs();
+    }
+    if (msgs.length > limit) msgs = msgs.slice(-limit);
+
+    return msgs.map((m) => ({
+      id: { _serialized: sid(m.id), id: m.id && m.id.id },
+      timestamp: m.t || m.timestamp || 0,
+      body: m.body || '',
+      author: sid(m.author) || sid(m.from) || '',
+      from: sid(m.from) || '',
+      _data: { notifyName: m.notifyName || (m.senderObj && (m.senderObj.pushname || m.senderObj.name)) || '' }
+    }));
+  }, chatId, limit);
+}
+
+async function fetchTargetMessages(target, limit) {
+  const chatId = serializedId(target.id) || target.id;
+  if (typeof target.fetchMessages === 'function') {
+    try {
+      return await withTimeout(target.fetchMessages({ limit }), 45000, 'fetchMessages');
+    } catch (e) {
+      log('WARN', `fetchMessages failed (${e.message || e}), using page.evaluate fallback`);
+    }
+  }
+  return withTimeout(fetchChatMessagesViaPage(chatId, limit), 45000, 'fetchMessagesFallback');
+}
+
+async function resolveTargetGroup() {
+  if (cachedTargetChat) return cachedTargetChat;
+
+  let chats;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      chats = await getChatsSafe();
+      break;
+    } catch (e) {
+      log('WARN', `getChats attempt ${attempt}/5 failed: ${e.message || e}`);
+      if (attempt === 5) throw e;
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+  }
+
+  const groups = (chats || []).filter((c) => c.isGroup);
+  const target = groups.find((g) => normalize(g.name).includes(normalize(TARGET_GROUP_NAME)));
+  if (!target) {
+    log('WARN', 'Target group not found: ' + TARGET_GROUP_NAME);
+    return null;
+  }
+
+  cachedTargetChat = target;
+  log('SYNC', 'Cached target group: ' + target.name);
+  return target;
+}
 
 async function syncTodayMessagesFromWhatsApp() {
   if (isSyncRunning) {
-    log("SYNC", "Skip: already running");
-    return;
+    log('SYNC', 'Skip: already running');
+    return false;
   }
 
   isSyncRunning = true;
-  log("SYNC", "Start");
+  log('SYNC', 'Start');
 
   try {
     const nowSec = Math.floor(Date.now() / 1000);
     const sinceSec = nowSec - 172800;
 
+    const target = await resolveTargetGroup();
+    if (!target) return false;
 
-    const normalize = s => (s || "").toLowerCase().replace(/[^a-z0-9 ]/g, "");
-
-    let target = cachedTargetChat;
-
-    if (!target) {
-      let chats;
-
-      for (let attempt = 1; attempt <= 5; attempt++) {
-        try {
-          chats = await withTimeout(client.getChats(), 30000, "getChats");
-          break;
-        } catch (e) {
-          log("WARN", `getChats attempt ${attempt}/5 failed: ${e.message || e}`);
-          if (attempt === 5) throw e;
-          await new Promise(r => setTimeout(r, 5000));
-        }
-      }
-
-      const groups = chats.filter(c => c.isGroup);
-      target = groups.find(g => normalize(g.name).includes(normalize(TARGET_GROUP_NAME)));
-
-      if (!target) {
-        log("WARN", "Target group not found: " + TARGET_GROUP_NAME);
-        return;
-      }
-
-      cachedTargetChat = target;
-      log("SYNC", "Cached target group: " + target.name);
+    try {
+      await fetchTargetMessages(target, 1);
+    } catch (e) {
+      log('WARN', 'warmup fetch failed: ' + (e.message || e));
     }
 
-    await withTimeout(target.fetchMessages({ limit: 1 }), 15000, "warmup fetch");
-    const messages = await withTimeout(target.fetchMessages({ limit: 2000 }), 45000, "fetchMessages");
+    const messages = await fetchTargetMessages(target, 2000);
     if (messages.length) {
       const toSec = (v) => {
         const n = Number(v || 0);
         return n > 1000000000000 ? Math.floor(n / 1000) : Math.floor(n);
       };
-      const secs = messages.map(m => toSec(m.timestamp)).filter(Boolean);
+      const secs = messages.map((m) => toSec(m.timestamp)).filter(Boolean);
       const minTs = Math.min(...secs);
       const maxTs = Math.max(...secs);
-      log("SYNC", "Fetched ts range min=" + minTs + " max=" + maxTs + " count=" + secs.length);
-      log("SYNC", "Fetched ts ISO min=" + new Date(minTs * 1000).toISOString() + " max=" + new Date(maxTs * 1000).toISOString());
+      log('SYNC', 'Fetched ts range min=' + minTs + ' max=' + maxTs + ' count=' + secs.length);
+      log('SYNC', 'Fetched ts ISO min=' + new Date(minTs * 1000).toISOString() + ' max=' + new Date(maxTs * 1000).toISOString());
     }
 
     let saved = 0, old = 0, dup = 0;
@@ -267,11 +387,11 @@ async function syncTodayMessagesFromWhatsApp() {
       const ts = rawTs > 1000000000000 ? Math.floor(rawTs / 1000) : Math.floor(rawTs);
       if (!ts || ts < sinceSec || ts > nowSec) { old++; continue; }
 
-      const msgId = (msg.id && (msg.id._serialized || msg.id.id)) || (String(ts) + "-" + (msg.author || msg.from || "unknown"));
-      const exists = db.prepare("SELECT id FROM messages WHERE msg_id = ?").get(msgId);
+      const msgId = serializedId(msg.id) || (String(ts) + '-' + (msg.author || msg.from || 'unknown'));
+      const exists = db.prepare('SELECT id FROM messages WHERE msg_id = ?').get(msgId);
       if (exists) { dup++; continue; }
 
-      const sender = (msg._data && msg._data.notifyName) || msg.author || msg.from || "Unknown";
+      const sender = (msg._data && msg._data.notifyName) || msg.author || msg.from || 'Unknown';
       if (!msg.body || msg.body.trim().length === 0) { old++; continue; }
       const body = msg.body.trim();
 
@@ -279,10 +399,13 @@ async function syncTodayMessagesFromWhatsApp() {
       saved++;
     }
 
-    log("SYNC", "Done: fetched=" + messages.length + " saved=" + saved + " old=" + old + " dup=" + dup);
+    log('SYNC', 'Done: fetched=' + messages.length + ' saved=' + saved + ' old=' + old + ' dup=' + dup);
+    return true;
   } catch (e) {
-    log("ERR", "SYNC failed: " + (e?.message || String(e)));
-    log("ERR", e?.stack || "no stack");
+    log('ERR', 'SYNC failed: ' + (e?.message || String(e)));
+    log('ERR', e?.stack || 'no stack');
+    cachedTargetChat = null;
+    return false;
   } finally {
     isSyncRunning = false;
   }
@@ -333,9 +456,9 @@ app.get('/health', (req, res) => {
 
 app.get('/sync', async (req, res) => {
   if (!isReady) return res.send(`<html><body style="${style}"><h1>⚠️ Not connected yet</h1><a href="/">← Back</a></body></html>`);
-  await syncTodayMessagesFromWhatsApp();
+  const ok = await syncTodayMessagesFromWhatsApp();
   const messages = fetchLast24HoursMessages();
-  res.send(`<html><body style="${style}"><h1>🔄 Sync complete</h1><p>Found <strong>${messages.length}</strong> messages from today.</p><a href="/debug" style="color:#25D366">📋 View messages</a> &nbsp;<a href="/" style="color:#aaa">← Back</a></body></html>`);
+  res.send(`<html><body style="${style}"><h1>${ok ? '🔄 Sync complete' : '⚠️ Sync failed'}</h1><p>Found <strong>${messages.length}</strong> messages from today.</p><p style="color:#aaa">Check the event log if sync failed — the bot is still running.</p><a href="/debug" style="color:#25D366">📋 View messages</a> &nbsp;<a href="/" style="color:#aaa">← Back</a></body></html>`);
 });
 
 app.get('/summary', async (req, res) => {
@@ -358,7 +481,7 @@ app.get('/debug', (req, res) => {
 app.get('/diagnose', async (req, res) => {
   if (!isReady) return res.send(`<html><body style="${style}"><h1>⚠️ Not connected yet</h1><a href="/">← Back</a></body></html>`);
   try {
-    const chats = await client.getChats();
+    const chats = await getChatsSafe();
     const groups = chats.filter(c => c.isGroup);
     const today = todayInTZ();
     res.send(`<html><body style="${monoStyle}"><h2>🔍 Diagnostics</h2><p>Server time (UTC): <strong>${new Date().toISOString()}</strong></p><p>Today (${SUMMARY_TIMEZONE}): <strong>${today}</strong></p><p>TARGET_GROUP_NAME: <strong>"${TARGET_GROUP_NAME}"</strong></p><p>Total chats: ${chats.length} | Groups: ${groups.length}</p><hr><h3>All Groups (${groups.length}):</h3>${groups.map(g => { const matches = normalize(g.name).includes(normalize(TARGET_GROUP_NAME)); return `<div style="padding:8px;border-bottom:1px solid #333;background:${matches ? '#1a3a1a' : 'transparent'}">${matches ? '✅ MATCH' : '❌'} <strong>"${g.name}"</strong><span style="color:#aaa;font-size:12px"> — ${g.participants?.length || '?'} participants</span></div>`; }).join('')}<br><a href="/" style="color:#25D366">← Back</a></body></html>`);
@@ -373,15 +496,20 @@ app.get('/eventlog', (req, res) => {
 
 app.listen(PORT, () => log('🌐', `Web server on port ${PORT}`));
 
+const WA_WEB_VERSION = process.env.WA_WEB_VERSION || '2.2412.54';
+const WA_WEB_VERSION_HTML = process.env.WA_WEB_VERSION_HTML ||
+  `https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/${WA_WEB_VERSION}.html`;
+
 const client = new Client({
   authStrategy: new LocalAuth({ dataPath: AUTH_DIR }),
   puppeteer: {
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
     protocolTimeout: 120000
   },
+  webVersion: WA_WEB_VERSION,
   webVersionCache: {
     type: 'remote',
-    remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html'
+    remotePath: WA_WEB_VERSION_HTML
   }
 });
 
@@ -404,9 +532,12 @@ client.on('ready', async () => {
 
   log('✅', 'Client ready');
   log('📡', `Monitoring: "${TARGET_GROUP_NAME}"`);
+  log('🌐', `Pinned WhatsApp Web version: ${WA_WEB_VERSION}`);
 
   setTimeout(() => {
-    syncTodayMessagesFromWhatsApp();
+    syncTodayMessagesFromWhatsApp().catch((e) => {
+      log('ERR', 'startup sync: ' + (e.message || e));
+    });
   }, 15000);
 });
 client.on('disconnected', reason => { cachedTargetChat = null;
@@ -419,13 +550,29 @@ client.on('disconnected', reason => { cachedTargetChat = null;
 client.on('message', async msg => {
   try {
     if (!msg.from.endsWith('@g.us')) return;
-    const chat = await msg.getChat();
-    if (!normalize(chat.name).includes(normalize(TARGET_GROUP_NAME))) return;
-    const contact = await msg.getContact();
-    const sender = contact.pushname || contact.name || contact.number;
+    let chatName = '';
+    try {
+      const chat = await msg.getChat();
+      chatName = chat.name;
+    } catch (e) {
+      if (cachedTargetChat && serializedId(cachedTargetChat.id) === msg.from) {
+        chatName = cachedTargetChat.name || TARGET_GROUP_NAME;
+      } else {
+        log('WARN', `msg.getChat failed (${e.message || e}); skipping until group cache is ready`);
+        return;
+      }
+    }
+    if (!normalize(chatName).includes(normalize(TARGET_GROUP_NAME))) return;
+    let sender = 'Unknown';
+    try {
+      const contact = await msg.getContact();
+      sender = contact.pushname || contact.name || contact.number || sender;
+    } catch (e) {
+      sender = msg.author || msg.from || sender;
+    }
     const ts = Math.floor(Number(msg.timestamp || 0));
     if (!msg.body || msg.body.trim().length === 0) return;
-    const msgId = (msg.id && (msg.id._serialized || msg.id.id)) || `${ts}-${sender || "unknown"}`;
+    const msgId = serializedId(msg.id) || `${ts}-${sender || "unknown"}`;
     saveMessage(msgId, sender, msg.body.trim(), ts);
   } catch (err) { log('❌', `message event error: ${err.message}`); }
 });
@@ -438,6 +585,10 @@ setInterval(async () => {
   try {
     await withTimeout(client.getState(), 10000, "health check");
   } catch (e) {
+    if (isEvaluateStoreError(e)) {
+      log('WARN', 'Health check hit WhatsApp Web evaluate error (non-fatal): ' + e.message);
+      return;
+    }
     log("💀", "WhatsApp unhealthy: " + e.message);
     process.exit(1);
   }
