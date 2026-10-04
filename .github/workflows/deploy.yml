@@ -41,5 +41,9 @@ jobs:
               "DATA_DIR=/data" \
               "PORT=8080" \
               > .env
+            # The current OCI container was created outside Compose. Remove the
+            # stopped container so Compose can adopt its fixed container name;
+            # omitting -v preserves its anonymous data volume for recovery.
+            docker rm -f wa-summary-agent 2>/dev/null || true
             docker compose up -d --build
             docker image prune -f
