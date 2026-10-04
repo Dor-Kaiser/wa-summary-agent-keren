@@ -1,4 +1,8 @@
 .env
+.env.*
+!.env.example
+.vercel/
+ssh-key-*.key*
 *.bak
 *.bak.*
 *.backup-*

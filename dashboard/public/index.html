@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0a1110">
+  <title>WhatsApp Summary Agent</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0a1110;--panel:#111d1a;--line:#24352f;--muted:#91a69d;--text:#eaf3ee;--green:#25d366;--red:#fb7185;--amber:#fbbf24}
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(900px 500px at 85% -10%,#17382b 0,transparent 60%),var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
+    main{width:min(980px,calc(100% - 32px));margin:48px auto}.top{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:28px}.eyebrow{font-size:12px;text-transform:uppercase;letter-spacing:.14em;color:var(--green);font-weight:700}h1{font-size:clamp(26px,5vw,38px);margin:6px 0}p{margin:6px 0;color:var(--muted)}.pill{padding:7px 12px;border:1px solid var(--line);border-radius:999px;color:var(--muted);white-space:nowrap}.pill.ok{color:var(--green);border-color:#286743}.pill.bad{color:var(--red);border-color:#6f3440}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.card{background:linear-gradient(145deg,#14221d,#101916);border:1px solid var(--line);border-radius:16px;padding:20px;min-width:0}.wide{grid-column:1/-1}.card h2{font-size:17px;margin:0 0 14px}.details{display:grid;grid-template-columns:150px 1fr;gap:8px 12px}.label{color:var(--muted)}.actions{display:flex;flex-wrap:wrap;gap:10px}.button{background:#1a2d25;border:1px solid #315342;color:var(--text);border-radius:10px;padding:10px 14px;font:inherit;cursor:pointer}.button.primary{background:#168847;border-color:#168847}.button:disabled{opacity:.5;cursor:wait}.notice{min-height:24px;color:var(--amber);margin-top:12px}.qr-wrap{text-align:center}.qr-wrap img{width:min(280px,100%);background:#fff;padding:10px;border-radius:12px}.empty{padding:18px;border:1px dashed var(--line);border-radius:12px;text-align:center;color:var(--muted)}.list{max-height:420px;overflow:auto}.row{padding:12px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}.row:last-child{border-bottom:0}.row strong{color:var(--green)}.meta{font-size:12px;color:var(--muted)}.group{padding:9px 0;border-bottom:1px solid var(--line)}.group.match{color:var(--green)}pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0;font:12px/1.7 ui-monospace,monospace;color:#b8c9c0}
+    @media(max-width:700px){main{margin:28px auto}.grid{grid-template-columns:1fr}.wide{grid-column:auto}.top{align-items:center}.details{grid-template-columns:115px 1fr}}
+  </style>
+</head>
+<body>
+  <main>
+    <header class="top">
+      <div><div class="eyebrow">WhatsApp Summary Agent</div><h1>Group monitor</h1><p id="subtitle">Connecting to worker…</p></div>
+      <div id="connection" class="pill">Starting</div>
+    </header>
+    <div class="grid">
+      <section class="card"><h2>Connection</h2><div id="details" class="details"><span class="label">Worker</span><span>Loading…</span></div><div id="qr" class="qr-wrap"></div></section>
+      <section class="card"><h2>Actions</h2><div class="actions"><button class="button primary" data-action="sync">Sync messages</button><button class="button" data-action="summary">Send summary now</button><button class="button" data-action="diagnostics">Diagnose groups</button><button class="button" data-action="messages">Refresh messages</button><button class="button" data-action="events">Refresh event log</button></div><div id="notice" class="notice" role="status"></div></section>
+      <section id="diagnostic-card" class="card wide" hidden><h2>Group diagnostics</h2><div id="diagnostics" class="list"></div></section>
+      <section id="messages-card" class="card wide" hidden><h2>Captured messages <span id="message-total" class="meta"></span></h2><div id="messages" class="list"></div></section>
+      <section id="events-card" class="card wide" hidden><h2>Worker event log</h2><pre id="events" class="list"></pre></section>
+    </div>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const escText = (value) => String(value ?? '');
+    async function api(path, method = 'GET') {
+      const response = await fetch(`/api/${path}`, { method, cache: 'no-store' });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || `Request failed (${response.status})`);
+      return body;
+    }
+    function addText(parent, tag, text, className) {
+      const el = document.createElement(tag); el.textContent = escText(text); if (className) el.className = className; parent.append(el); return el;
+    }
+    async function loadStatus() {
+      try {
+        const data = await api('status');
+        const connection = $('connection'); connection.textContent = data.ready ? 'Connected' : data.connectionStatus; connection.className = `pill ${data.ready ? 'ok' : 'bad'}`;
+        $('subtitle').textContent = data.ready ? `Monitoring “${data.targetGroupName}”` : 'WhatsApp worker is waiting for a connection';
+        const details = $('details'); details.replaceChildren();
+        [['Group', data.targetGroupName], ['Daily summary', `${data.summaryHour}:${data.summaryMinute} (${data.timezone})`], ['Local date', `${data.todayInTZ} (${data.timezone})`]].forEach(([label,value]) => { addText(details,'span',label,'label'); addText(details,'span',value); });
+        const qr = $('qr'); qr.replaceChildren();
+        if (data.qrDataUrl) { addText(qr,'p','Scan with WhatsApp → Settings → Linked Devices → Link a Device'); const img = document.createElement('img'); img.src = data.qrDataUrl; img.alt = 'WhatsApp linking QR code'; qr.append(img); }
+        if (data.missing?.length) $('notice').textContent = `Worker configuration missing: ${data.missing.join(', ')}`;
+      } catch (error) { $('connection').textContent = 'Worker unavailable'; $('connection').className = 'pill bad'; $('subtitle').textContent = error.message; }
+    }
+    async function showMessages() {
+      const data = await api('messages'); const list = $('messages'); list.replaceChildren(); $('message-total').textContent = `(${data.total} total; showing latest 100)`;
+      if (!data.messages.length) addText(list,'div','No captured messages yet.','empty');
+      data.messages.forEach(message => { const row = document.createElement('div'); row.className='row'; addText(row,'div',new Date(message.timestamp*1000).toLocaleString()+' · '+message.day,'meta'); const line=document.createElement('div'); addText(line,'strong',message.sender); line.append(document.createTextNode(': '+escText(message.body))); row.append(line); list.append(row); }); $('messages-card').hidden=false;
+    }
+    async function showDiagnostics() {
+      const data = await api('diagnostics'); const list = $('diagnostics'); list.replaceChildren();
+      addText(list,'div',`${data.totalChats} chats · ${data.groups.length} groups · target “${data.targetGroupName}”`,'meta');
+      data.groups.forEach(group => { const row=addText(list,'div',`${group.matches?'✓':'·'} ${group.name} · ${group.participants ?? '?'} participants`,'group'); if(group.matches) row.classList.add('match'); }); $('diagnostic-card').hidden=false;
+    }
+    async function showEvents() { const data=await api('events'); $('events').textContent=data.events.join('\n'); $('events-card').hidden=false; }
+    document.querySelectorAll('[data-action]').forEach(button => button.addEventListener('click', async () => {
+      const action=button.dataset.action; button.disabled=true; $('notice').textContent='Working…';
+      try {
+        if(action==='sync'){const result=await api('sync','POST'); $('notice').textContent=`Sync complete · ${result.messageCount} messages in the last 24 hours`;}
+        else if(action==='summary'){await api('summary','POST'); $('notice').textContent='Summary sent to WhatsApp.';}
+        else if(action==='messages'){await showMessages(); $('notice').textContent='Messages refreshed.';}
+        else if(action==='diagnostics'){await showDiagnostics(); $('notice').textContent='Group diagnostics refreshed.';}
+        else {await showEvents(); $('notice').textContent='Event log refreshed.';}
+      } catch(error) { $('notice').textContent=error.message; }
+      finally {button.disabled=false;}
+    }));
+    loadStatus(); setInterval(loadStatus,5000);
+  </script>
+</body>
+</html>

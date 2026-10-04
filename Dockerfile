@@ -13,11 +13,7 @@ RUN npm install
 COPY index.js .
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
-COPY entrypoint.sh .
-RUN chmod +x entrypoint.sh
 RUN mkdir -p /data
 VOLUME ["/data"]
 EXPOSE 8080
-ENTRYPOINT ["/app/entrypoint.sh"]
-
 ENTRYPOINT ["/app/entrypoint.sh"]

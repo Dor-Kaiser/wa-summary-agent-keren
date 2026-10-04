@@ -1,8 +1,9 @@
-name: Deploy to Oracle
+name: Deploy WhatsApp worker to OCI Always Free
 
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -17,12 +18,13 @@ jobs:
           SUMMARY_HOUR: ${{ secrets.SUMMARY_HOUR }}
           SUMMARY_MINUTE: ${{ secrets.SUMMARY_MINUTE }}
           SUMMARY_TIMEZONE: ${{ secrets.SUMMARY_TIMEZONE }}
+          WORKER_API_TOKEN: ${{ secrets.WORKER_API_TOKEN }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.SSH_PORT }}
-          envs: GEMINI_API_KEY,TARGET_GROUP_NAME,MY_NUMBER,SUMMARY_HOUR,SUMMARY_MINUTE,SUMMARY_TIMEZONE
+          envs: GEMINI_API_KEY,TARGET_GROUP_NAME,MY_NUMBER,SUMMARY_HOUR,SUMMARY_MINUTE,SUMMARY_TIMEZONE,WORKER_API_TOKEN
           script: |
             set -e
             cd ~/wa-summary-bot
@@ -35,6 +37,7 @@ jobs:
               "SUMMARY_HOUR=${SUMMARY_HOUR}" \
               "SUMMARY_MINUTE=${SUMMARY_MINUTE}" \
               "SUMMARY_TIMEZONE=${SUMMARY_TIMEZONE}" \
+              "WORKER_API_TOKEN=${WORKER_API_TOKEN}" \
               "DATA_DIR=/data" \
               "PORT=8080" \
               > .env

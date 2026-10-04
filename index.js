@@ -33,7 +33,8 @@ const MY_NUMBER         = process.env.MY_NUMBER || '';
 const SUMMARY_HOUR      = process.env.SUMMARY_HOUR || '18';
 const SUMMARY_MINUTE    = process.env.SUMMARY_MINUTE || '0';
 const SUMMARY_TIMEZONE  = process.env.SUMMARY_TIMEZONE || 'Asia/Jerusalem';
-const REQUIRED_ENV      = ['GEMINI_API_KEY', 'TARGET_GROUP_NAME', 'MY_NUMBER'];
+const WORKER_API_TOKEN  = process.env.WORKER_API_TOKEN || '';
+const REQUIRED_ENV      = ['GEMINI_API_KEY', 'TARGET_GROUP_NAME', 'MY_NUMBER', 'WORKER_API_TOKEN'];
 
 log('⚙️', `Config — GROUP="${TARGET_GROUP_NAME}" NUMBER="${MY_NUMBER}" SUMMARY=${SUMMARY_HOUR}:${SUMMARY_MINUTE} TZ=${SUMMARY_TIMEZONE}`);
 
@@ -481,109 +482,118 @@ async function syncTodayMessagesFromWhatsApp() {
   }
 }
 
-const style = `font-family:sans-serif;background:#111;color:#fff;padding:40px;text-align:center`;
-const monoStyle = `font-family:monospace;background:#111;color:#eee;padding:30px`;
+// The worker API is called only by the Vercel server-side proxy. Keep its
+// liveness endpoint deliberately minimal; every endpoint with WhatsApp or
+// message data requires the shared worker token.
+function requireWorkerToken(req, res, next) {
+  const provided = req.get('authorization') || '';
+  const expected = `Bearer ${WORKER_API_TOKEN}`;
+  const providedBuffer = Buffer.from(provided);
+  const expectedBuffer = Buffer.from(expected);
+  if (!WORKER_API_TOKEN || providedBuffer.length !== expectedBuffer.length ||
+      !require('crypto').timingSafeEqual(providedBuffer, expectedBuffer)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
 
-app.get('/', async (req, res) => {
-  const missing = missingEnv();
-  if (missing.length) {
-    return res.send(`<html><body style="${style}">
-      <h1>⚠️ Missing configuration</h1>
-      <p>Set these environment variables and restart:</p>
-      <pre style="display:inline-block;text-align:left;background:#222;padding:16px;border-radius:8px">${missing.join('\n')}</pre>
-    </body></html>`);
-  }
-  if (isReady) {
-    return res.send(`<html><body style="${style}">
-      <h1>✅ Connected to WhatsApp</h1>
-      <p>Monitoring: <strong>${TARGET_GROUP_NAME}</strong></p>
-      <p>Daily summary at <strong>${SUMMARY_HOUR}:${String(SUMMARY_MINUTE).padStart(2,'0')}</strong> (${SUMMARY_TIMEZONE})</p>
-      <br>
-      <a href="/sync" style="background:#25D366;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;margin:8px;display:inline-block">🔄 Sync Messages</a>
-      <a href="/summary" style="background:#128C7E;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;margin:8px;display:inline-block">📊 Send Summary Now</a>
-      <br><br>
-      <a href="/debug" style="color:#aaa;margin:10px;display:inline-block">📋 View Captured Messages</a>
-      <a href="/diagnose" style="color:#aaa;margin:10px;display:inline-block">🔍 Diagnose Groups</a>
-      <a href="/eventlog" style="color:#aaa;margin:10px;display:inline-block">📜 Event Log</a>
-    </body></html>`);
-  }
-  if (!lastQR) {
-    return res.send(`<html><head><meta http-equiv="refresh" content="3"></head>
-    <body style="${style}"><h1>⏳ ${connectionStatus}</h1><p>Refreshing...</p></body></html>`);
-  }
-  const qrImage = await QRCode.toDataURL(lastQR);
-  res.send(`<html><head><meta http-equiv="refresh" content="30"></head>
-  <body style="${style}">
-    <h1>📱 Scan with WhatsApp</h1>
-    <p>Settings → Linked Devices → Link a Device</p>
-    <img src="${qrImage}" style="width:300px;height:300px;border:10px solid white;border-radius:12px"/>
-  </body></html>`);
+app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+
+app.use('/api', requireWorkerToken);
+
+app.get('/api/status', async (_req, res) => {
+  let qrDataUrl = null;
+  if (!isReady && lastQR) qrDataUrl = await QRCode.toDataURL(lastQR);
+  res.json({
+    status: missingEnv().length ? 'missing_config' : (isReady ? 'ok' : 'connecting'),
+    ready: isReady,
+    connectionStatus,
+    qrDataUrl,
+    targetGroupName: TARGET_GROUP_NAME,
+    summaryHour: SUMMARY_HOUR,
+    summaryMinute: String(SUMMARY_MINUTE).padStart(2, '0'),
+    timezone: SUMMARY_TIMEZONE,
+    todayInTZ: todayInTZ(),
+    missing: missingEnv()
+  });
 });
 
-app.get('/health', (req, res) => {
-  res.json({ status: missingEnv().length ? 'missing_config' : (isReady ? 'ok' : 'connecting'), ready: isReady, connectionStatus, timezone: SUMMARY_TIMEZONE, todayInTZ: todayInTZ(), missing: missingEnv() });
-});
-
-app.get('/sync', async (req, res) => {
-  if (!isReady) return res.send(`<html><body style="${style}"><h1>⚠️ Not connected yet</h1><a href="/">← Back</a></body></html>`);
+app.post('/api/sync', async (_req, res) => {
+  if (!isReady) return res.status(409).json({ error: 'WhatsApp is not connected yet' });
   const ok = await syncTodayMessagesFromWhatsApp();
-  const messages = fetchLast24HoursMessages();
-  res.send(`<html><body style="${style}"><h1>${ok ? '🔄 Sync complete' : '⚠️ Sync failed'}</h1><p>Found <strong>${messages.length}</strong> messages from today.</p><p style="color:#aaa">Check the event log if sync failed — the bot is still running.</p><a href="/debug" style="color:#25D366">📋 View messages</a> &nbsp;<a href="/" style="color:#aaa">← Back</a></body></html>`);
+  res.status(ok ? 200 : 502).json({ ok, messageCount: fetchLast24HoursMessages().length });
 });
 
-app.get('/summary', async (req, res) => {
-  if (!isReady) return res.send(`<html><body style="${style}"><h1>⚠️ Not connected yet</h1><a href="/">← Back</a></body></html>`);
+app.post('/api/summary', async (_req, res) => {
+  if (!isReady) return res.status(409).json({ error: 'WhatsApp is not connected yet' });
   try {
     await dailySummaryJob();
-    res.send(`<html><body style="${style}"><h1>✅ Summary sent!</h1><a href="/" style="color:#25D366">← Back</a></body></html>`);
+    res.json({ ok: true });
   } catch (err) {
     log('❌', `Summary error: ${err.message}`);
-    res.send(`<html><body style="${monoStyle}"><h1 style="color:red">Error</h1><pre>${err.message}\n${err.stack}</pre></body></html>`);
+    res.status(500).json({ error: 'Summary failed. Check worker logs.' });
   }
 });
 
-app.get('/debug', (req, res) => {
-  const messages = db.prepare('SELECT * FROM messages ORDER BY timestamp DESC LIMIT 100').all();
-  const total = db.prepare('SELECT COUNT(*) as n FROM messages').get();
-  res.send(`<html><body style="${monoStyle}"><h2>📋 Messages in DB: ${total.n} total, showing last 100</h2>${messages.length === 0 ? '<p style="color:orange">⚠️ No messages yet. Try /sync first.</p>' : ''}${messages.map(m => `<div style="border-bottom:1px solid #333;padding:6px 0"><span style="color:#aaa">${new Date(m.timestamp*1000).toLocaleString('en-GB', { timeZone: SUMMARY_TIMEZONE })} [${m.day}]</span><strong style="color:#25D366"> ${m.sender}</strong>: ${m.body}</div>`).join('')}<br><a href="/" style="color:#25D366">← Back</a></body></html>`);
+app.get('/api/messages', (_req, res) => {
+  const messages = db.prepare('SELECT sender, body, timestamp, day FROM messages ORDER BY timestamp DESC LIMIT 100').all();
+  const total = db.prepare('SELECT COUNT(*) as n FROM messages').get().n;
+  res.json({ total, messages });
 });
 
-app.get('/diagnose', async (req, res) => {
-  if (!isReady) return res.send(`<html><body style="${style}"><h1>⚠️ Not connected yet</h1><a href="/">← Back</a></body></html>`);
+app.get('/api/diagnostics', async (_req, res) => {
+  if (!isReady) return res.status(409).json({ error: 'WhatsApp is not connected yet' });
   try {
     const chats = await getChatsSafe();
-    const groups = chats.filter(c => c.isGroup);
-    const today = todayInTZ();
-    res.send(`<html><body style="${monoStyle}"><h2>🔍 Diagnostics</h2><p>Server time (UTC): <strong>${new Date().toISOString()}</strong></p><p>Today (${SUMMARY_TIMEZONE}): <strong>${today}</strong></p><p>TARGET_GROUP_NAME: <strong>"${TARGET_GROUP_NAME}"</strong></p><p>Total chats: ${chats.length} | Groups: ${groups.length}</p><hr><h3>All Groups (${groups.length}):</h3>${groups.map(g => { const matches = normalize(g.name).includes(normalize(TARGET_GROUP_NAME)); return `<div style="padding:8px;border-bottom:1px solid #333;background:${matches ? '#1a3a1a' : 'transparent'}">${matches ? '✅ MATCH' : '❌'} <strong>"${g.name}"</strong><span style="color:#aaa;font-size:12px"> — ${g.participants?.length || '?'} participants</span></div>`; }).join('')}<br><a href="/" style="color:#25D366">← Back</a></body></html>`);
+    const groups = chats.filter(c => c.isGroup).map(g => ({
+      name: g.name,
+      participants: g.participants?.length ?? null,
+      matches: normalize(g.name).includes(normalize(TARGET_GROUP_NAME))
+    }));
+    res.json({ serverTime: new Date().toISOString(), timezone: SUMMARY_TIMEZONE, today: todayInTZ(), targetGroupName: TARGET_GROUP_NAME, totalChats: chats.length, groups });
   } catch (err) {
-    res.send(`<pre style="color:red">${err.message}\n${err.stack}</pre>`);
+    log('❌', `Diagnostics error: ${err.message}`);
+    res.status(500).json({ error: 'Diagnostics failed. Check worker logs.' });
   }
 });
 
-app.get('/eventlog', (req, res) => {
-  res.send(`<html><body style="${monoStyle}"><h2>📜 Event Log (last 200 events)</h2><div style="font-size:12px;line-height:1.8">${eventLog.map(e => `<div style="border-bottom:1px solid #222">${e}</div>`).join('')}</div><br><a href="/" style="color:#25D366">← Back</a></body></html>`);
-});
+app.get('/api/events', (_req, res) => res.json({ events: eventLog }));
 
 app.listen(PORT, () => log('🌐', `Web server on port ${PORT}`));
-
-const WA_WEB_VERSION = process.env.WA_WEB_VERSION || '2.2412.54';
-const WA_WEB_VERSION_HTML = process.env.WA_WEB_VERSION_HTML ||
-  `https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/${WA_WEB_VERSION}.html`;
 
 const client = new Client({
   authStrategy: new LocalAuth({ dataPath: AUTH_DIR }),
   puppeteer: {
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
     protocolTimeout: 120000
-  },
-  webVersion: WA_WEB_VERSION,
-  webVersionCache: {
-    type: 'remote',
-    remotePath: WA_WEB_VERSION_HTML
   }
 });
 
-client.on('qr', qr => { lastQR = qr; connectionStatus = 'QR ready — open this URL to scan'; log('📱', 'QR code generated'); });
+const pagesWithDiagnostics = new WeakSet();
+function attachBrowserDiagnostics() {
+  const page = client.pupPage;
+  if (!page || pagesWithDiagnostics.has(page)) return;
+  pagesWithDiagnostics.add(page);
+  page.on('console', message => {
+    if (message.type() !== 'error' && message.type() !== 'warning') return;
+    log('🧭', `WhatsApp Web console ${message.type()}: ${message.text().slice(0, 500)}`);
+  });
+  page.on('pageerror', error => {
+    log('🧭', `WhatsApp Web page error: ${String(error.stack || error.message || error).slice(0, 1000)}`);
+  });
+  page.on('requestfailed', request => {
+    const failure = request.failure();
+    const safeUrl = request.url().split(/[?#]/, 1)[0];
+    log('🧭', `WhatsApp Web request failed: ${request.method()} ${safeUrl} ${failure?.errorText || ''}`.slice(0, 1000));
+  });
+}
+
+client.on('qr', qr => {
+  lastQR = qr;
+  connectionStatus = 'QR ready — open this URL to scan';
+  attachBrowserDiagnostics();
+  log('📱', 'QR code generated');
+});
 client.on('authenticated', () => { connectionStatus = 'authenticated'; log('🔐', 'Authenticated'); });
 client.on('auth_failure', msg => { connectionStatus = 'auth failed'; log('❌', `Auth failure: ${msg}`); });
 
@@ -602,7 +612,11 @@ client.on('ready', async () => {
 
   log('✅', 'Client ready');
   log('📡', `Monitoring: "${TARGET_GROUP_NAME}"`);
-  log('🌐', `Pinned WhatsApp Web version: ${WA_WEB_VERSION}`);
+  try {
+    log('🌐', `WhatsApp Web version: ${await client.getWWebVersion()}`);
+  } catch (e) {
+    log('WARN', `Could not read WhatsApp Web version: ${e.message || e}`);
+  }
 
   setTimeout(() => {
     syncTodayMessagesFromWhatsApp().catch((e) => {
